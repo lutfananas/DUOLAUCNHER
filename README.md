@@ -16,12 +16,23 @@ Mod dari `DuoLauncher-0.15.0-beta01-release.apk`. Halaman Library di home screen
   - 3 ikon besar → langsung membuka aplikasi.
   - Gugus 4 ikon kecil di pojok kanan bawah → membuka folder penuh
     (latar diburamkan, grid 4 kolom, ketuk area kosong / Back untuk menutup).
-- Folder **Suggestions** (4 ikon, dari aplikasi yang paling sering/terakhir dibuka
-  dari App Library) dan **Recently Added** (aplikasi yang baru dipasang).
+- Folder **Recently Added** (aplikasi yang baru dipasang). Folder Suggestions sudah dihapus.
+- **Mode Edit** (tombol *Edit* di samping kolom pencarian, atau tekan lama area kosong /
+  folder): folder bergoyang seperti di iPhone, lalu bisa:
+  - **＋ Folder**: membuat folder baru (langsung terbuka untuk diisi lewat *Add Apps*).
+  - Tombol **−** di pojok folder: menghapus folder (aplikasinya kembali ke folder
+    otomatis / Other, tidak di-uninstall). Recently Added juga bisa dihapus.
+  - Ketuk nama folder (✎): ganti nama.
+  - Buka folder → ketuk aplikasi untuk memindahkannya ke folder lain, atau **Add Apps**
+    untuk memilih banyak aplikasi sekaligus.
+  - **Reset**: kembali ke susunan otomatis.
+  - **Wallpaper**: pilih foto dari galeri sebagai latar launcher, atau kembali ke
+    "Duo dunes". Latar langsung berganti, blur kaca ikut diperbarui.
+- Tekan lama aplikasi di mana saja → **Move to Folder…** juga tersedia.
 - Kategori otomatis: Social, Entertainment, Creativity, Productivity & Finance,
   Utilities, Games, Travel, Shopping & Food, Health & Fitness,
   Information & Reading, Other — dari kategori Android + kata kunci nama paket.
-- Tekan lama ikon → menu **Open / App info / Uninstall**.
+- Tekan lama ikon → menu **Open / Move to Folder… / App info / Uninstall**.
 - **Frosted glass**: halaman App Library menampilkan foto latar launcher yang diburamkan
   (sedikit lebih jenuh warnanya, seperti iOS). Latar buram ini ikut bergeser masuk saat
   halaman digeser. Folder, kolom pencarian, dan daftar hasil pencarian memakai panel kaca
@@ -30,6 +41,10 @@ Mod dari `DuoLauncher-0.15.0-beta01-release.apk`. Halaman Library di home screen
 
 ## Cara kerja
 - `mod/src/.../AppLibraryView.java` — tampilan App Library (View Android biasa).
+- `mod/src/.../LibraryModel.java` — susunan folder buatan pengguna (disimpan sebagai JSON).
+- `mod/src/.../Categories.java` — kategori otomatis.
+- `mod/src/.../WallpaperActivity.java` — pemilih foto; menyimpan ke file & preferensi yang
+  sama dengan menu "Wallpaper & appearance" bawaan dan memperbarui latar secara langsung.
 - `mod/src/.../Glass.java` — blur latar (box blur pada salinan kecil
   `files/launcher-background.jpg`) dan panel kaca.
 - `mod/src/.../AppLibrary.java` — jembatan ke Compose (`AndroidView`), menerima daftar

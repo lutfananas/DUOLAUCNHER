@@ -26,7 +26,19 @@ if perm not in m:
                   '<uses-permission android:name="android.permission.BIND_APPWIDGET"/>\n    ' + perm, 1)
     manifest.write_text(m)
 
-# 3. Mark the build.
+# 3. Helper activity for "Change Wallpaper" in the App Library.
+m = manifest.read_text()
+act = ('<activity android:excludeFromRecents="true" android:exported="false" '
+       'android:name="com.jake.duolauncher.applib.WallpaperActivity" '
+       'android:theme="@android:style/Theme.Translucent.NoTitleBar"/>')
+if "applib.WallpaperActivity" not in m:
+    m = m.replace('<activity android:excludeFromRecents="true" android:exported="false" android:name="com.jake.duolauncher.DiscoverActivity"',
+                  act + '\n        <activity android:excludeFromRecents="true" android:exported="false" android:name="com.jake.duolauncher.DiscoverActivity"', 1)
+    if "applib.WallpaperActivity" not in m:
+        sys.exit("could not register WallpaperActivity")
+    manifest.write_text(m)
+
+# 4. Mark the build.
 yml = dec / "apktool.yml"
 y = yml.read_text()
 yml.write_text(y.replace("versionName: 0.15.0-beta01", "versionName: 0.15.0-beta01-applibrary"))

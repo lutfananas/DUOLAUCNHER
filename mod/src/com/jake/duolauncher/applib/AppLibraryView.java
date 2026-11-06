@@ -2,19 +2,21 @@ package com.jake.duolauncher.applib;
 
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.ApplicationInfo;
 import android.content.pm.LauncherApps;
-import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.ColorFilter;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
@@ -23,20 +25,22 @@ import android.graphics.RenderEffect;
 import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
-import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Editable;
+import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.util.TypedValue;
 import android.view.GestureDetector;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
@@ -46,42 +50,55 @@ import android.widget.LinearLayout;
 import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.text.Collator;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * An iPhone-style "App Library" page: a search field on top, then a two-column
- * grid of category folders (Suggestions, Recently Added, Social, ...). Each folder
- * shows three large icons that launch directly plus a cluster of small icons that
- * opens the whole category. Searching shows an alphabetical list of every app.
+ * grid of folders (Recently Added, Social, ... plus the user's own folders). Each
+ * folder shows three large icons that launch directly plus a cluster of small
+ * icons that opens the whole folder. Searching shows an alphabetical list.
+ *
+ * Edit mode (Edit button, or long-press on empty space) lets the user create,
+ * rename and delete folders, move apps between folders and change the wallpaper.
  */
 public final class AppLibraryView extends FrameLayout {
 
-    static final String SUGGESTIONS = "Suggestions";
     static final String RECENTLY_ADDED = "Recently Added";
     static final String OTHER = "Other";
+    static final String[] AUTO_NAMES = {
+            "Social", "Entertainment", "Creativity", "Productivity & Finance", "Utilities",
+            "Games", "Travel", "Shopping & Food", "Health & Fitness", "Information & Reading",
+    };
+
+    static final int KIND_RECENT = 0, KIND_CUSTOM = 1, KIND_AUTO = 2, KIND_OTHER = 3;
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
-    private static final Map<String, Integer> CATEGORY_CACHE = new HashMap<>();
-    private static final Map<String, long[]> INSTALL_CACHE = new HashMap<>();
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final float density;
     private final boolean dark;
     private final SharedPreferences prefs;
+    private final LibraryModel model;
 
     private final LinearLayout content;
+    private final LinearLayout searchRow;
+    private final LinearLayout editBar;
     private final EditText search;
+    private final TextView editButton;
     private final TextView cancel;
     private final ScrollView gridScroll;
     private final LinearLayout grid;
@@ -92,18 +109,23 @@ public final class AppLibraryView extends FrameLayout {
     private List<?> sourceApps;
     private List<Entry> entries = new ArrayList<>();
     private List<Category> categories = new ArrayList<>();
+    private Map<String, String> folderOf = new HashMap<>();
+    private Map<String, String> autoOf = new HashMap<>();
     private int generation;
     private boolean searching;
+    private boolean editing;
     private boolean overlayOpen;
+    private String overlayName;
+    private final List<ValueAnimator> jiggles = new ArrayList<>();
 
     // Frosted backdrop: the launcher's background photo, blurred, pinned to the window.
     private Bitmap backdrop;
     private final Paint backdropPaint = Glass.backdropPaint();
     private final Paint tintPaint = new Paint();
-    private final android.graphics.Matrix backdropMatrix = new android.graphics.Matrix();
+    private final Matrix backdropMatrix = new Matrix();
     private final int[] windowPos = new int[2];
     private int drawnX = Integer.MIN_VALUE, drawnY = Integer.MIN_VALUE;
-    private final android.view.ViewTreeObserver.OnPreDrawListener tracker = () -> {
+    private final ViewTreeObserver.OnPreDrawListener tracker = () -> {
         getLocationInWindow(windowPos);
         if (windowPos[0] != drawnX || windowPos[1] != drawnY) invalidate();
         return true;
@@ -123,22 +145,31 @@ public final class AppLibraryView extends FrameLayout {
         Bitmap icon() {
             return app.c;
         }
-        boolean available() {
-            return app.i;
-        }
         String id() {
             return app.a != null ? app.a : pkg;
+        }
+        String title() {
+            return app.h ? label + "  ·  Work" : label;
         }
     }
 
     static final class Category {
         final String name;
         final List<Entry> apps;
-        final boolean fourLarge;
-        Category(String name, List<Entry> apps, boolean fourLarge) {
+        final int kind;
+        Category(String name, List<Entry> apps, int kind) {
             this.name = name;
             this.apps = apps;
-            this.fourLarge = fourLarge;
+            this.kind = kind;
+        }
+        boolean deletable() {
+            return kind != KIND_OTHER;
+        }
+        boolean renamable() {
+            return kind == KIND_CUSTOM || kind == KIND_AUTO;
+        }
+        boolean acceptsApps() {
+            return kind != KIND_RECENT;
         }
     }
 
@@ -148,6 +179,11 @@ public final class AppLibraryView extends FrameLayout {
         dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
                 == Configuration.UI_MODE_NIGHT_YES;
         prefs = context.getSharedPreferences("duo_app_library", Context.MODE_PRIVATE);
+        model = new LibraryModel(prefs);
+        Activity act = activity();
+        if (act instanceof com.jake.duolauncher.MainActivity) {
+            WallpaperActivity.launcher = new java.lang.ref.WeakReference<>((com.jake.duolauncher.MainActivity) act);
+        }
         setClipChildren(false);
         setWillNotDraw(false);
         tintPaint.setColor(dark ? 0x40000000 : 0x14000000);
@@ -158,8 +194,8 @@ public final class AppLibraryView extends FrameLayout {
         content.setOrientation(LinearLayout.VERTICAL);
         addView(content, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
 
-        // Search row
-        LinearLayout searchRow = new LinearLayout(context);
+        // ---- Search row: [search field] [Edit | Cancel]
+        searchRow = new LinearLayout(context);
         searchRow.setOrientation(LinearLayout.HORIZONTAL);
         searchRow.setGravity(Gravity.CENTER_VERTICAL);
         searchRow.setPadding(dp(4), dp(6), dp(4), dp(14));
@@ -179,23 +215,43 @@ public final class AppLibraryView extends FrameLayout {
         glass.setBounds(0, 0, dp(18), dp(18));
         search.setCompoundDrawablesRelative(glass, null, null, null);
         search.setBackground(new Glass.PanelDrawable(dark, density, dp(12)));
-        search.setShadowLayer(0, 0, 0, 0);
         searchRow.addView(search, new LinearLayout.LayoutParams(0, dp(42), 1f));
 
-        cancel = new TextView(context);
-        cancel.setText("Cancel");
-        cancel.setTextColor(0xFFFFFFFF);
-        cancel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
-        cancel.setPadding(dp(14), dp(8), dp(4), dp(8));
-        cancel.setShadowLayer(4 * density, 0, density, 0x66000000);
+        editButton = textButton("Edit");
+        editButton.setOnClickListener(v -> setEditing(true));
+        searchRow.addView(editButton, wrap());
+
+        cancel = textButton("Cancel");
         cancel.setVisibility(GONE);
         cancel.setOnClickListener(v -> exitSearch());
-        searchRow.addView(cancel, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        searchRow.addView(cancel, wrap());
         content.addView(searchRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Category grid
+        // ---- Edit bar: [+ Folder] [Wallpaper] [Reset] ... [Done]
+        editBar = new LinearLayout(context);
+        editBar.setOrientation(LinearLayout.HORIZONTAL);
+        editBar.setGravity(Gravity.CENTER_VERTICAL);
+        editBar.setPadding(dp(4), dp(6), dp(4), dp(14));
+        editBar.setVisibility(GONE);
+        View newFolder = pill("＋ Folder", false);
+        newFolder.setOnClickListener(v -> newFolderDialog(null));
+        editBar.addView(newFolder, pillParams());
+        View wallpaper = pill("Wallpaper", false);
+        wallpaper.setOnClickListener(v -> wallpaperDialog());
+        editBar.addView(wallpaper, pillParams());
+        View reset = pill("Reset", false);
+        reset.setOnClickListener(v -> resetDialog());
+        editBar.addView(reset, pillParams());
+        editBar.addView(new View(context), new LinearLayout.LayoutParams(0, 1, 1f));
+        View done = pill("Done", true);
+        done.setOnClickListener(v -> setEditing(false));
+        editBar.addView(done, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(38)));
+        content.addView(editBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // ---- Folder grid
         gridScroll = new ScrollView(context);
         gridScroll.setVerticalScrollBarEnabled(false);
         gridScroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
@@ -203,13 +259,17 @@ public final class AppLibraryView extends FrameLayout {
         gridScroll.setPadding(0, 0, 0, dp(24));
         grid = new LinearLayout(context);
         grid.setOrientation(LinearLayout.VERTICAL);
-        grid.setPadding(dp(4), 0, dp(4), 0);
+        grid.setPadding(dp(4), dp(4), dp(4), dp(40));
+        grid.setOnLongClickListener(v -> {
+            pageMenu(v);
+            return true;
+        });
         gridScroll.addView(grid, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         content.addView(gridScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        // Alphabetical search list
+        // ---- Alphabetical search list
         listScroll = new ScrollView(context);
         listScroll.setVerticalScrollBarEnabled(false);
         listScroll.setClipToPadding(false);
@@ -223,7 +283,7 @@ public final class AppLibraryView extends FrameLayout {
         content.addView(listScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        // Expanded category overlay
+        // ---- Expanded folder overlay
         overlay = new FrameLayout(context);
         overlay.setVisibility(GONE);
         overlay.setClickable(true);
@@ -263,7 +323,7 @@ public final class AppLibraryView extends FrameLayout {
         overlay.setPadding(dp(4), dp(16), dp(4), bottom);
     }
 
-    // ---------------------------------------------------------------- data
+    // ================================================================= data
 
     void setApps(List<?> apps) {
         if (apps == null || apps == sourceApps) return;
@@ -277,24 +337,48 @@ public final class AppLibraryView extends FrameLayout {
         Collections.sort(next, (x, y) -> collator.compare(x.label, y.label));
         entries = next;
         if (searching) rebuildList();
+        recompute(null);
+    }
 
+    /** Rebuilds the folders from the current app list and the user's model. */
+    private void recompute(final Runnable then) {
         final int gen = ++generation;
+        final List<Entry> all = entries;
         final PackageManager pm = getContext().getPackageManager();
+        final List<String> custom;
+        final Map<String, String> assign;
+        final Set<String> hidden;
+        synchronized (model) {
+            custom = new ArrayList<>(model.custom);
+            assign = new HashMap<>(model.assign);
+            hidden = new HashSet<>(model.hidden);
+        }
         WORKER.execute(() -> {
-            final List<Category> built = buildCategories(pm, next);
+            final Map<String, String> folders = new HashMap<>();
+            final Map<String, String> autos = new HashMap<>();
+            final List<Category> built = buildCategories(pm, all, custom, assign, hidden, folders, autos);
             main.post(() -> {
                 if (gen != generation) return;
                 categories = built;
+                folderOf = folders;
+                autoOf = autos;
                 rebuildGrid();
+                if (overlayOpen && overlayName != null) {
+                    Category c = find(overlayName);
+                    if (c != null) renderOverlay(c, false);
+                    else closeOverlay();
+                }
+                if (then != null) then.run();
             });
         });
     }
 
-    private List<Category> buildCategories(PackageManager pm, List<Entry> all) {
+    private List<Category> buildCategories(PackageManager pm, List<Entry> all, List<String> custom,
+            Map<String, String> assign, Set<String> hidden,
+            Map<String, String> folderOut, Map<String, String> autoOut) {
         List<Category> out = new ArrayList<>();
 
-        // Suggestions: apps launched most often / most recently from this page.
-        List<Entry> suggestions = new ArrayList<>();
+        // Usage scores: most-used apps first inside a folder, like iOS.
         final Map<Entry, Double> scores = new HashMap<>();
         for (Entry e : all) {
             String v = prefs.getString("use:" + e.id(), null);
@@ -307,182 +391,89 @@ public final class AppLibraryView extends FrameLayout {
             } catch (RuntimeException ignored) {
             }
         }
-        List<Entry> used = new ArrayList<>(scores.keySet());
-        Collections.sort(used, (x, y) -> Double.compare(scores.get(y), scores.get(x)));
-        for (Entry e : used) {
-            if (suggestions.size() < 4) suggestions.add(e);
-        }
 
-        // Recently Added: newest user-installed apps.
-        List<Entry> recent = new ArrayList<>();
-        final Map<Entry, Long> installed = new HashMap<>();
-        for (Entry e : all) {
-            long[] info = installInfo(pm, e.pkg);
-            if (info[1] == 0) installed.put(e, info[0]);
-        }
-        recent.addAll(installed.keySet());
-        Collections.sort(recent, (x, y) -> Long.compare(installed.get(y), installed.get(x)));
-        if (recent.size() > 16) recent = new ArrayList<>(recent.subList(0, 16));
-
-        for (Entry e : recent) {
-            if (suggestions.size() >= 4) break;
-            if (!suggestions.contains(e)) suggestions.add(e);
-        }
-        for (Entry e : all) {
-            if (suggestions.size() >= 4) break;
-            if (!suggestions.contains(e)) suggestions.add(e);
-        }
-        if (!suggestions.isEmpty()) out.add(new Category(SUGGESTIONS, suggestions, true));
-        if (!recent.isEmpty()) out.add(new Category(RECENTLY_ADDED, recent, false));
-
-        // Categories
-        Map<String, List<Entry>> groups = new LinkedHashMap<>();
-        for (Entry e : all) {
-            String name = categoryName(categoryOf(pm, e.pkg), e.pkg, e.label);
-            List<Entry> g = groups.get(name);
-            if (g == null) {
-                g = new ArrayList<>();
-                groups.put(name, g);
+        // Recently Added: newest user-installed apps (shown in addition to their folder).
+        if (!hidden.contains(RECENTLY_ADDED)) {
+            final Map<Entry, Long> installed = new HashMap<>();
+            for (Entry e : all) {
+                long[] info = Categories.installInfo(pm, e.pkg);
+                if (info[1] == 0) installed.put(e, info[0]);
             }
-            g.add(e);
+            List<Entry> recent = new ArrayList<>(installed.keySet());
+            Collections.sort(recent, (x, y) -> Long.compare(installed.get(y), installed.get(x)));
+            if (recent.size() > 16) recent = new ArrayList<>(recent.subList(0, 16));
+            if (!recent.isEmpty()) out.add(new Category(RECENTLY_ADDED, recent, KIND_RECENT));
         }
-        List<Map.Entry<String, List<Entry>>> sorted = new ArrayList<>(groups.entrySet());
+
+        Set<String> autoNames = new HashSet<>();
+        Collections.addAll(autoNames, AUTO_NAMES);
+
+        Map<String, List<Entry>> customGroups = new LinkedHashMap<>();
+        for (String c : custom) customGroups.put(c, new ArrayList<>());
+        Map<String, List<Entry>> autoGroups = new LinkedHashMap<>();
+        List<Entry> other = new ArrayList<>();
+
+        for (Entry e : all) {
+            String auto = Categories.categoryName(Categories.categoryOf(pm, e.pkg), e.pkg, e.label);
+            autoOut.put(e.id(), auto);
+            String target = assign.get(e.id());
+            if (target != null) {
+                boolean valid = customGroups.containsKey(target) || OTHER.equals(target)
+                        || (autoNames.contains(target) && !hidden.contains(target));
+                if (!valid) target = null;
+            }
+            if (target == null) {
+                target = (OTHER.equals(auto) || hidden.contains(auto)) ? OTHER : auto;
+            }
+            folderOut.put(e.id(), target);
+            if (customGroups.containsKey(target)) {
+                customGroups.get(target).add(e);
+            } else if (OTHER.equals(target)) {
+                other.add(e);
+            } else {
+                List<Entry> g = autoGroups.get(target);
+                if (g == null) {
+                    g = new ArrayList<>();
+                    autoGroups.put(target, g);
+                }
+                g.add(e);
+            }
+        }
+
+        for (Map.Entry<String, List<Entry>> g : customGroups.entrySet()) {
+            out.add(new Category(g.getKey(), byUse(g.getValue(), scores), KIND_CUSTOM));
+        }
+        List<Map.Entry<String, List<Entry>>> sorted = new ArrayList<>(autoGroups.entrySet());
         Collections.sort(sorted, (x, y) -> {
-            boolean xo = OTHER.equals(x.getKey()), yo = OTHER.equals(y.getKey());
-            if (xo != yo) return xo ? 1 : -1;
-            double sx = 0, sy = 0;
-            for (Entry e : x.getValue()) if (scores.containsKey(e)) sx += 1;
-            for (Entry e : y.getValue()) if (scores.containsKey(e)) sy += 1;
-            if (sx != sy) return Double.compare(sy, sx);
+            int sx = 0, sy = 0;
+            for (Entry e : x.getValue()) if (scores.containsKey(e)) sx++;
+            for (Entry e : y.getValue()) if (scores.containsKey(e)) sy++;
+            if (sx != sy) return Integer.compare(sy, sx);
             int c = Integer.compare(y.getValue().size(), x.getValue().size());
             return c != 0 ? c : x.getKey().compareTo(y.getKey());
         });
         for (Map.Entry<String, List<Entry>> g : sorted) {
-            List<Entry> apps = g.getValue();
-            // Most-used apps first inside a folder, like iOS.
-            final List<Entry> ordered = new ArrayList<>(apps);
-            Collections.sort(ordered, (x, y) -> {
-                Double a = scores.get(x), b = scores.get(y);
-                if (a == null && b == null) return 0;
-                if (a == null) return 1;
-                if (b == null) return -1;
-                return Double.compare(b, a);
-            });
-            out.add(new Category(g.getKey(), ordered, false));
+            out.add(new Category(g.getKey(), byUse(g.getValue(), scores), KIND_AUTO));
         }
+        if (!other.isEmpty()) out.add(new Category(OTHER, byUse(other, scores), KIND_OTHER));
         return out;
     }
 
-    private static int categoryOf(PackageManager pm, String pkg) {
-        synchronized (CATEGORY_CACHE) {
-            Integer c = CATEGORY_CACHE.get(pkg);
-            if (c != null) return c;
-        }
-        int cat = ApplicationInfo.CATEGORY_UNDEFINED;
-        try {
-            cat = pm.getApplicationInfo(pkg, 0).category;
-        } catch (Exception ignored) {
-        }
-        synchronized (CATEGORY_CACHE) {
-            CATEGORY_CACHE.put(pkg, cat);
-        }
-        return cat;
+    private static List<Entry> byUse(List<Entry> apps, final Map<Entry, Double> scores) {
+        List<Entry> ordered = new ArrayList<>(apps);
+        Collections.sort(ordered, (x, y) -> {
+            Double a = scores.get(x), b = scores.get(y);
+            if (a == null && b == null) return 0;
+            if (a == null) return 1;
+            if (b == null) return -1;
+            return Double.compare(b, a);
+        });
+        return ordered;
     }
 
-    /** Returns {firstInstallTime, isSystem(1/0)}. */
-    private static long[] installInfo(PackageManager pm, String pkg) {
-        synchronized (INSTALL_CACHE) {
-            long[] c = INSTALL_CACHE.get(pkg);
-            if (c != null) return c;
-        }
-        long[] info = {0, 1};
-        try {
-            PackageInfo pi = pm.getPackageInfo(pkg, 0);
-            boolean system = pi.applicationInfo != null
-                    && (pi.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
-            info = new long[]{pi.firstInstallTime, system ? 1 : 0};
-        } catch (Exception ignored) {
-        }
-        synchronized (INSTALL_CACHE) {
-            INSTALL_CACHE.put(pkg, info);
-        }
-        return info;
-    }
-
-    static String categoryName(int category, String pkg, String label) {
-        String s = (pkg + " " + label).toLowerCase(Locale.ROOT);
-        // Strong keyword matches first: many apps don't declare a category.
-        if (has(s, "game", "games", "mobilelegends", "pubg", "freefire", "roblox", "minecraft",
-                "supercell", "clashof", "candycrush", "genshin", "hoyoverse", "moonton", "garena", "chess")) {
-            return "Games";
-        }
-        switch (category) {
-            case ApplicationInfo.CATEGORY_GAME: return "Games";
-            case ApplicationInfo.CATEGORY_SOCIAL: return "Social";
-            case ApplicationInfo.CATEGORY_AUDIO:
-            case ApplicationInfo.CATEGORY_VIDEO: return "Entertainment";
-            case ApplicationInfo.CATEGORY_IMAGE: return "Creativity";
-            case ApplicationInfo.CATEGORY_NEWS: return "Information & Reading";
-            case ApplicationInfo.CATEGORY_MAPS: return "Travel";
-            case ApplicationInfo.CATEGORY_PRODUCTIVITY: return "Productivity & Finance";
-            case ApplicationInfo.CATEGORY_ACCESSIBILITY: return "Utilities";
-            default: break;
-        }
-        if (has(s, "whatsapp", "telegram", "facebook", "instagram", "twitter", "messenger", "discord",
-                "snapchat", "signal", "wechat", "messaging", "mms", "contacts", "dialer", "phone",
-                "threads", "linkedin", "reddit", "jp.naver.line", "viber", "skype", "tinder", "bumble",
-                "bluesky", "mastodon", "michat", "kakao")) {
-            return "Social";
-        }
-        if (has(s, "youtube", "netflix", "spotify", "music", "video", "tiktok", "musically", "twitch",
-                "primevideo", "disney", "hotstar", "player", "podcast", "vidio", "joox", "soundcloud",
-                "deezer", "radio", "iqiyi", "wetv", "viu", "hbo", "tv", "anime", "webtoon", "movie")) {
-            return "Entertainment";
-        }
-        if (has(s, "camera", "photo", "gallery", "snapseed", "lightroom", "capcut", "canva", "picsart",
-                "editor", "vsco", "inshot", "remini", "draw", "sketch", "paint")) {
-            return "Creativity";
-        }
-        if (has(s, "docs", "sheets", "slides", "drive", "office", "word", "excel", "powerpoint", "gmail",
-                "mail", "outlook", "calendar", "notes", "keep", "bank", "pay", "wallet", "finance",
-                "bca", "mandiri", "bri", "bni", "dana", "ovo", "gopay", "jenius", "notion", "todo",
-                "task", "zoom", "meet", "teams", "slack", "trello", "pdf", "scanner", "money", "invest",
-                "bibit", "ajaib", "stock", "crypto", "binance", "indodax", "paypal", "authenticator")) {
-            return "Productivity & Finance";
-        }
-        if (has(s, "shop", "tokopedia", "shopee", "lazada", "amazon", "blibli", "bukalapak", "food",
-                "alfamart", "indomaret", "supermarket", "alfagift", "store.", "ikea", "zalora", "temu", "aliexpress", "mcdonald",
-                "kfc", "starbucks", "restaurant", "grocery")) {
-            return "Shopping & Food";
-        }
-        if (has(s, "maps", "waze", "grab", "gojek", "uber", "traveloka", "tiket", "airbnb", "booking",
-                "krl", "transport", "flight", "airline", "garuda", "lionair", "kai.", "trip", "travel",
-                "agoda", "maxim", "indrive")) {
-            return "Travel";
-        }
-        if (has(s, "health", "fit", "strava", "halodoc", "alodokter", "workout", "sleep", "medit",
-                "calm", "headspace", "step", "peduli", "satusehat", "bpjs")) {
-            return "Health & Fitness";
-        }
-        if (has(s, "news", "kindle", "books", "wiki", "reader", "detik", "kompas", "medium", "quora",
-                "dictionary", "translate", "duolingo", "learn", "quizlet", "brainly",
-                "ruangguru", "weather", "flipboard")) {
-            return "Information & Reading";
-        }
-        if (has(s, "settings", "calculator", "clock", "files", "filemanager", "browser", "chrome",
-                "firefox", "opera", "launcher", "vpn", "recorder", "compass", "flashlight", "torch",
-                "vending", "googlequicksearchbox", "assistant", "gms", "security", "cleaner", "backup",
-                "bluetooth", "wifi", "clipboard", "keyboard", "inputmethod", "android.", "samsung",
-                "miui", "xiaomi", "oppo", "coloros", "vivo", "huawei", "sec.", "nothing",
-                "motorola", "oneplus", "google.android")) {
-            return "Utilities";
-        }
-        return OTHER;
-    }
-
-    private static boolean has(String haystack, String... needles) {
-        for (String n : needles) if (haystack.contains(n)) return true;
-        return false;
+    private Category find(String name) {
+        for (Category c : categories) if (c.name.equals(name)) return c;
+        return null;
     }
 
     static String normalize(String s) {
@@ -503,9 +494,10 @@ public final class AppLibraryView extends FrameLayout {
         return starts;
     }
 
-    // ---------------------------------------------------------------- grid
+    // ================================================================= grid
 
     private void rebuildGrid() {
+        stopJiggle();
         grid.removeAllViews();
         Context ctx = getContext();
         for (int i = 0; i < categories.size(); i += 2) {
@@ -528,36 +520,45 @@ public final class AppLibraryView extends FrameLayout {
             rlp.bottomMargin = dp(14);
             grid.addView(row, rlp);
         }
+        if (editing) startJiggle();
     }
 
-    private View folder(Category cat) {
+    private View folder(final Category cat) {
         Context ctx = getContext();
         LinearLayout box = new LinearLayout(ctx);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setClipChildren(false);
+        box.setTag("folder");
         TileView tile = new TileView(ctx, cat);
         box.addView(tile, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         TextView label = new TextView(ctx);
-        label.setText(cat.name);
+        label.setText(editing && cat.renamable() ? cat.name + " ✎" : cat.name);
         label.setTextColor(0xFFFFFFFF);
         label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
         label.setGravity(Gravity.CENTER_HORIZONTAL);
         label.setSingleLine(true);
         label.setEllipsize(TextUtils.TruncateAt.END);
         label.setShadowLayer(4 * density, 0, density, 0x80000000);
-        label.setPadding(0, dp(6), 0, 0);
+        label.setPadding(0, dp(6), 0, dp(2));
+        label.setOnClickListener(v -> {
+            if (editing && cat.renamable()) renameDialog(cat);
+            else openCategory(cat);
+        });
         box.addView(label, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         return box;
     }
 
-    /** A category folder: 3 large icons + a 2x2 cluster of small icons. */
+    /** A folder tile: 3 large icons + a 2x2 cluster of small icons. */
     final class TileView extends View {
         private final Category cat;
         private final Glass.Panel glass = new Glass.Panel(dark, density);
         private final RectF bounds = new RectF();
         private final Paint icon = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final Paint badge = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint badgeLine = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint plus = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF tmp = new RectF();
         private final GestureDetector gestures;
         private int pressed = -1;
@@ -565,34 +566,43 @@ public final class AppLibraryView extends FrameLayout {
         TileView(Context ctx, Category cat) {
             super(ctx);
             this.cat = cat;
+            badge.setColor(0xF0E5E5EA);
+            badgeLine.setColor(0xFF1C1C1E);
+            badgeLine.setStrokeWidth(2.2f * density);
+            badgeLine.setStrokeCap(Paint.Cap.ROUND);
+            plus.setColor(0x99FFFFFF);
+            plus.setStrokeWidth(3f * density);
+            plus.setStrokeCap(Paint.Cap.ROUND);
             setContentDescription(cat.name);
             gestures = new GestureDetector(ctx, new GestureDetector.SimpleOnGestureListener() {
                 @Override public boolean onDown(MotionEvent e) {
-                    pressed = quadrant(e.getX(), e.getY());
+                    pressed = editing ? -1 : quadrant(e.getX(), e.getY());
                     invalidate();
                     return true;
                 }
                 @Override public boolean onSingleTapUp(MotionEvent e) {
-                    tap(quadrant(e.getX(), e.getY()));
+                    if (editing) {
+                        if (cat.deletable() && inBadge(e.getX(), e.getY())) deleteDialog(cat);
+                        else openCategory(cat);
+                    } else {
+                        tap(quadrant(e.getX(), e.getY()));
+                    }
                     return true;
                 }
                 @Override public void onLongPress(MotionEvent e) {
-                    int q = quadrant(e.getX(), e.getY());
-                    Entry target = single(q);
                     pressed = -1;
                     invalidate();
-                    if (target != null) {
-                        performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
-                        showAppMenu(TileView.this, target);
-                    } else if (q >= 0) {
-                        openCategory(cat);
-                    }
+                    if (editing) return;
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                    Entry target = single(quadrant(e.getX(), e.getY()));
+                    if (target != null) showAppMenu(TileView.this, target);
+                    else setEditing(true);
                 }
             });
         }
 
         private boolean cluster() {
-            return !cat.fourLarge && cat.apps.size() > 4;
+            return cat.apps.size() > 4;
         }
 
         /** The app a quadrant launches directly, or null if it opens the folder. */
@@ -603,13 +613,14 @@ public final class AppLibraryView extends FrameLayout {
         }
 
         private void tap(int q) {
-            if (q < 0) return;
             Entry e = single(q);
-            if (e != null) {
-                launch(e, this, cell(q));
-            } else if (q == 3) {
-                openCategory(cat);
-            }
+            if (e != null) launch(e, this, cell(q));
+            else if (q == 3 || cat.apps.isEmpty() || q >= cat.apps.size()) openCategory(cat);
+        }
+
+        private boolean inBadge(float x, float y) {
+            float r = getWidth() * 0.16f;
+            return x < r && y < r;
         }
 
         private int quadrant(float x, float y) {
@@ -637,11 +648,9 @@ public final class AppLibraryView extends FrameLayout {
         public boolean onTouchEvent(MotionEvent event) {
             boolean handled = gestures.onTouchEvent(event);
             int a = event.getActionMasked();
-            if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
-                if (pressed != -1) {
-                    pressed = -1;
-                    invalidate();
-                }
+            if ((a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) && pressed != -1) {
+                pressed = -1;
+                invalidate();
             }
             return handled || super.onTouchEvent(event);
         }
@@ -659,6 +668,11 @@ public final class AppLibraryView extends FrameLayout {
             bounds.set(0, 0, w, getHeight());
             glass.draw(c, bounds, radius);
             int n = cat.apps.size();
+            if (n == 0) {
+                float cx = w / 2f, cy = getHeight() / 2f, s = w * 0.12f;
+                c.drawLine(cx - s, cy, cx + s, cy, plus);
+                c.drawLine(cx, cy - s, cx, cy + s, plus);
+            }
             for (int q = 0; q < 4; q++) {
                 RectF r = cell(q);
                 if (pressed == q) inset(r, r.width() * 0.06f);
@@ -674,6 +688,11 @@ public final class AppLibraryView extends FrameLayout {
                 } else if (q < n) {
                     drawIcon(c, cat.apps.get(q), r);
                 }
+            }
+            if (editing && cat.deletable()) {
+                float br = w * 0.075f, bc = w * 0.085f;
+                c.drawCircle(bc, bc, br, badge);
+                c.drawLine(bc - br * 0.5f, bc, bc + br * 0.5f, bc, badgeLine);
             }
         }
 
@@ -691,9 +710,311 @@ public final class AppLibraryView extends FrameLayout {
         r.bottom -= d;
     }
 
-    // ---------------------------------------------------------------- category overlay
+    // ================================================================= edit mode
+
+    private void setEditing(boolean on) {
+        if (on && searching) exitSearch();
+        if (editing == on) return;
+        editing = on;
+        searchRow.setVisibility(on ? GONE : VISIBLE);
+        editBar.setVisibility(on ? VISIBLE : GONE);
+        if (on) performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        rebuildGrid();
+        if (overlayOpen && overlayName != null) {
+            Category c = find(overlayName);
+            if (c != null) renderOverlay(c, false);
+        }
+        requestFocus();
+    }
+
+    private void startJiggle() {
+        int i = 0;
+        for (int r = 0; r < grid.getChildCount(); r++) {
+            ViewGroup row = (ViewGroup) grid.getChildAt(r);
+            for (int k = 0; k < row.getChildCount(); k++) {
+                View box = row.getChildAt(k);
+                if (!"folder".equals(box.getTag())) continue;
+                float amp = (i++ % 2 == 0) ? 1.4f : -1.4f;
+                ObjectAnimator a = ObjectAnimator.ofFloat(box, "rotation", -amp, amp);
+                a.setDuration(130 + (i % 3) * 12);
+                a.setRepeatCount(ValueAnimator.INFINITE);
+                a.setRepeatMode(ValueAnimator.REVERSE);
+                a.setStartDelay((i * 37) % 120);
+                a.start();
+                jiggles.add(a);
+            }
+        }
+    }
+
+    private void stopJiggle() {
+        for (ValueAnimator a : jiggles) a.cancel();
+        jiggles.clear();
+        for (int r = 0; r < grid.getChildCount(); r++) {
+            View row = grid.getChildAt(r);
+            if (!(row instanceof ViewGroup)) continue;
+            for (int k = 0; k < ((ViewGroup) row).getChildCount(); k++) {
+                ((ViewGroup) row).getChildAt(k).setRotation(0f);
+            }
+        }
+    }
+
+    private void pageMenu(View anchor) {
+        PopupMenu menu = new PopupMenu(getContext(), anchor, Gravity.CENTER);
+        menu.getMenu().add(0, 1, 0, editing ? "Done" : "Edit App Library");
+        menu.getMenu().add(0, 2, 1, "New Folder");
+        menu.getMenu().add(0, 3, 2, "Change Wallpaper");
+        menu.setOnMenuItemClickListener(item -> {
+            switch (item.getItemId()) {
+                case 1: setEditing(!editing); return true;
+                case 2: newFolderDialog(null); return true;
+                case 3: wallpaperDialog(); return true;
+                default: return false;
+            }
+        });
+        menu.show();
+    }
+
+    private AlertDialog.Builder dialog() {
+        return new AlertDialog.Builder(getContext(), dark
+                ? android.R.style.Theme_DeviceDefault_Dialog_Alert
+                : android.R.style.Theme_DeviceDefault_Light_Dialog_Alert);
+    }
+
+    private EditText nameField(String initial) {
+        EditText field = new EditText(getContext());
+        field.setSingleLine(true);
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
+        field.setHint("Folder name");
+        if (initial != null) {
+            field.setText(initial);
+            field.setSelection(initial.length());
+        }
+        return field;
+    }
+
+    private View padded(View v) {
+        FrameLayout f = new FrameLayout(getContext());
+        f.setPadding(dp(22), dp(8), dp(22), 0);
+        f.addView(v);
+        return f;
+    }
+
+    private void showKeyboard(final EditText field) {
+        field.requestFocus();
+        field.postDelayed(() -> {
+            InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.showSoftInput(field, 0);
+        }, 200);
+    }
+
+    /** Creates a folder; if {@code moveApp} is given it is moved into the new folder. */
+    private void newFolderDialog(final Entry moveApp) {
+        final EditText field = nameField(null);
+        AlertDialog d = dialog()
+                .setTitle("New Folder")
+                .setView(padded(field))
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Create", null)
+                .create();
+        d.setOnShowListener(x -> d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            final String name = field.getText().toString().trim();
+            if (name.isEmpty()) {
+                field.setError("Enter a name");
+                return;
+            }
+            if (model.nameTaken(name)) {
+                field.setError("A folder with this name already exists");
+                return;
+            }
+            model.createFolder(name);
+            if (moveApp != null) model.move(moveApp.id(), canonical(name));
+            d.dismiss();
+            recompute(() -> {
+                Category c = find(canonical(name));
+                if (c != null && moveApp == null) openCategory(c);
+            });
+        }));
+        d.show();
+        showKeyboard(field);
+    }
+
+    /** Returns the automatic-category spelling if {@code name} matches one. */
+    private static String canonical(String name) {
+        for (String a : AUTO_NAMES) if (a.equalsIgnoreCase(name)) return a;
+        return name;
+    }
+
+    private void renameDialog(final Category cat) {
+        final EditText field = nameField(cat.name);
+        AlertDialog d = dialog()
+                .setTitle("Rename Folder")
+                .setView(padded(field))
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", null)
+                .create();
+        d.setOnShowListener(x -> d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String name = field.getText().toString().trim();
+            if (name.isEmpty()) {
+                field.setError("Enter a name");
+                return;
+            }
+            if (name.equals(cat.name)) {
+                d.dismiss();
+                return;
+            }
+            if (model.nameTaken(name) && !name.equalsIgnoreCase(cat.name)) {
+                field.setError("A folder with this name already exists");
+                return;
+            }
+            if (cat.kind == KIND_CUSTOM) {
+                model.renameCustom(cat.name, name);
+            } else {
+                List<String> ids = new ArrayList<>();
+                for (Entry e : cat.apps) ids.add(e.id());
+                model.renameAuto(cat.name, name, ids);
+            }
+            if (cat.name.equals(overlayName)) overlayName = name;
+            d.dismiss();
+            recompute(null);
+        }));
+        d.show();
+        showKeyboard(field);
+    }
+
+    private void deleteDialog(final Category cat) {
+        String msg;
+        if (cat.kind == KIND_RECENT) {
+            msg = "The Recently Added folder will be hidden. Apps stay in their other folders.";
+        } else if (cat.apps.isEmpty()) {
+            msg = "This folder is empty.";
+        } else {
+            msg = cat.apps.size() + (cat.apps.size() == 1 ? " app" : " apps")
+                    + " in this folder will move back to their automatic folder (or Other). "
+                    + "No apps are uninstalled.";
+        }
+        dialog().setTitle("Delete “" + cat.name + "”?")
+                .setMessage(msg)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Delete", (d, w) -> {
+                    model.deleteFolder(cat.name, cat.kind == KIND_CUSTOM);
+                    recompute(null);
+                })
+                .show();
+    }
+
+    private void resetDialog() {
+        dialog().setTitle("Reset App Library?")
+                .setMessage("Your folders and app placements will be removed, and deleted folders "
+                        + "come back. Apps are sorted automatically again.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Reset", (d, w) -> {
+                    model.reset();
+                    recompute(null);
+                })
+                .show();
+    }
+
+    /** Lets the user pick the folder an app lives in. */
+    private void moveDialog(final Entry e) {
+        final List<String> names = new ArrayList<>();
+        final List<String> targets = new ArrayList<>();
+        String current = folderOf.get(e.id());
+        String auto = autoOf.get(e.id());
+        for (Category c : categories) {
+            if (!c.acceptsApps()) continue;
+            names.add((c.name.equals(current) ? "✓  " : "     ") + c.name);
+            targets.add(c.name);
+        }
+        if (auto != null && !names.isEmpty()) {
+            boolean exists = false;
+            for (String t : targets) if (t.equals(auto)) exists = true;
+            if (!exists && !OTHER.equals(auto) && !model.hidden.contains(auto)) {
+                names.add("     " + auto);
+                targets.add(auto);
+            }
+        }
+        names.add("     ＋ New Folder…");
+        targets.add(null);
+        dialog().setTitle("Move “" + e.label + "” to")
+                .setItems(names.toArray(new CharSequence[0]), (d, which) -> {
+                    String target = targets.get(which);
+                    if (target == null) {
+                        newFolderDialog(e);
+                        return;
+                    }
+                    String auto2 = autoOf.get(e.id());
+                    // Moving an app back to its automatic folder clears the override.
+                    model.move(e.id(), target.equals(auto2) ? null : target);
+                    recompute(null);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Multi-select list of all apps to put into {@code cat}. */
+    private void addAppsDialog(final Category cat) {
+        final List<Entry> all = new ArrayList<>(entries);
+        final CharSequence[] labels = new CharSequence[all.size()];
+        final boolean[] checked = new boolean[all.size()];
+        final boolean[] before = new boolean[all.size()];
+        for (int i = 0; i < all.size(); i++) {
+            Entry e = all.get(i);
+            String where = folderOf.get(e.id());
+            labels[i] = e.title() + (where != null && !where.equals(cat.name) ? "   (" + where + ")" : "");
+            checked[i] = before[i] = cat.name.equals(where);
+        }
+        dialog().setTitle("Apps in “" + cat.name + "”")
+                .setMultiChoiceItems(labels, checked, (d, which, isChecked) -> checked[which] = isChecked)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Done", (d, w) -> {
+                    synchronized (model) {
+                        for (int i = 0; i < all.size(); i++) {
+                            if (checked[i] == before[i]) continue;
+                            Entry e = all.get(i);
+                            String auto = autoOf.get(e.id());
+                            if (checked[i]) {
+                                if (cat.name.equals(auto) && !model.hidden.contains(auto)) model.assign.remove(e.id());
+                                else model.assign.put(e.id(), cat.name);
+                            } else {
+                                model.assign.remove(e.id());
+                                boolean stillHere = cat.name.equals(auto) && !model.hidden.contains(auto);
+                                if (stillHere || (OTHER.equals(cat.name) && (auto == null
+                                        || OTHER.equals(auto) || model.hidden.contains(auto)))) {
+                                    // It would land here again automatically: send it to Other instead.
+                                    if (!OTHER.equals(cat.name)) model.assign.put(e.id(), OTHER);
+                                }
+                            }
+                        }
+                        model.save();
+                    }
+                    recompute(null);
+                })
+                .show();
+    }
+
+    private void wallpaperDialog() {
+        CharSequence[] items = {"Choose photo…", "Reset to Duo dunes"};
+        dialog().setTitle("Wallpaper")
+                .setItems(items, (d, which) -> {
+                    if (which == 0) {
+                        WallpaperActivity.start(getContext());
+                    } else {
+                        WallpaperActivity.resetToDefault(getContext());
+                        refreshBackdrop();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // ================================================================= folder overlay
 
     private void openCategory(Category cat) {
+        overlayName = cat.name;
+        renderOverlay(cat, true);
+    }
+
+    private void renderOverlay(final Category cat, boolean animate) {
         Context ctx = getContext();
         overlay.removeAllViews();
 
@@ -702,32 +1023,51 @@ public final class AppLibraryView extends FrameLayout {
         panel.setPadding(dp(16), dp(28), dp(16), dp(16));
 
         TextView title = new TextView(ctx);
-        title.setText(cat.name);
+        title.setText(editing && cat.renamable() ? cat.name + "  ✎" : cat.name);
         title.setTextColor(0xFFFFFFFF);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
         title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         title.setShadowLayer(6 * density, 0, density, 0x66000000);
-        title.setPadding(0, 0, 0, dp(22));
+        title.setPadding(0, 0, 0, dp(editing ? 4 : 22));
+        if (cat.renamable()) {
+            title.setOnClickListener(v -> {
+                if (editing) renameDialog(cat);
+            });
+        }
         panel.addView(title, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        if (editing) {
+            TextView hint = new TextView(ctx);
+            hint.setText(cat.acceptsApps() ? "Tap an app to move it to another folder"
+                    : "Tap an app to move it to a folder");
+            hint.setTextColor(0xCCFFFFFF);
+            hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            hint.setGravity(Gravity.CENTER_HORIZONTAL);
+            hint.setPadding(0, 0, 0, dp(18));
+            panel.addView(hint, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+
+        List<View> cells = new ArrayList<>();
+        for (Entry e : cat.apps) cells.add(appCell(e));
+        if (cat.acceptsApps() && (editing || cat.kind == KIND_CUSTOM || cat.apps.isEmpty())) {
+            cells.add(addCell(cat));
+        }
 
         ScrollView scroll = new ScrollView(ctx);
         scroll.setVerticalScrollBarEnabled(false);
         LinearLayout rows = new LinearLayout(ctx);
         rows.setOrientation(LinearLayout.VERTICAL);
         final int cols = 4;
-        for (int i = 0; i < cat.apps.size(); i += cols) {
+        for (int i = 0; i < cells.size(); i += cols) {
             LinearLayout row = new LinearLayout(ctx);
             row.setOrientation(LinearLayout.HORIZONTAL);
             for (int j = 0; j < cols; j++) {
                 LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
                         ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-                if (i + j < cat.apps.size()) {
-                    row.addView(appCell(cat.apps.get(i + j)), lp);
-                } else {
-                    row.addView(new View(ctx), lp);
-                }
+                row.addView(i + j < cells.size() ? cells.get(i + j) : new View(ctx), lp);
             }
             LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -739,35 +1079,36 @@ public final class AppLibraryView extends FrameLayout {
         panel.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Taps on empty space close the folder; taps on the panel itself don't.
-        panel.setClickable(false);
         overlay.addView(panel, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT,
                 Gravity.TOP));
 
         overlayOpen = true;
         overlay.setVisibility(VISIBLE);
-        overlay.setAlpha(0f);
-        panel.setScaleX(0.88f);
-        panel.setScaleY(0.88f);
-        overlay.animate().alpha(1f).setDuration(180).setListener(null).start();
-        panel.animate().scaleX(1f).scaleY(1f).setDuration(220).start();
+        if (animate) {
+            overlay.setAlpha(0f);
+            panel.setScaleX(0.88f);
+            panel.setScaleY(0.88f);
+            overlay.animate().alpha(1f).setDuration(180).setListener(null).start();
+            panel.animate().scaleX(1f).scaleY(1f).setDuration(220).start();
+        } else {
+            overlay.setAlpha(1f);
+        }
         content.setRenderEffect(RenderEffect.createBlurEffect(dp(18), dp(18), Shader.TileMode.CLAMP));
         overlay.setFocusable(true);
         overlay.setFocusableInTouchMode(true);
         overlay.requestFocus();
     }
 
-    private View appCell(final Entry e) {
-        Context ctx = getContext();
-        LinearLayout cell = new LinearLayout(ctx);
-        cell.setOrientation(LinearLayout.VERTICAL);
-        cell.setGravity(Gravity.CENTER_HORIZONTAL);
-        ImageView iv = new ImageView(ctx);
-        iv.setImageBitmap(e.icon());
+    private ImageView iconView(Bitmap b) {
+        ImageView iv = new ImageView(getContext());
+        iv.setImageBitmap(b);
         iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        cell.addView(iv, new LinearLayout.LayoutParams(dp(58), dp(58)));
-        TextView tv = new TextView(ctx);
-        tv.setText(e.label);
+        return iv;
+    }
+
+    private TextView cellLabel(String text) {
+        TextView tv = new TextView(getContext());
+        tv.setText(text);
         tv.setTextColor(0xFFFFFFFF);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         tv.setSingleLine(true);
@@ -775,19 +1116,65 @@ public final class AppLibraryView extends FrameLayout {
         tv.setGravity(Gravity.CENTER_HORIZONTAL);
         tv.setShadowLayer(4 * density, 0, density, 0x80000000);
         tv.setPadding(dp(2), dp(5), dp(2), 0);
-        cell.addView(tv, new LinearLayout.LayoutParams(
+        return tv;
+    }
+
+    private View appCell(final Entry e) {
+        LinearLayout cell = new LinearLayout(getContext());
+        cell.setOrientation(LinearLayout.VERTICAL);
+        cell.setGravity(Gravity.CENTER_HORIZONTAL);
+        final ImageView iv = iconView(e.icon());
+        cell.addView(iv, new LinearLayout.LayoutParams(dp(58), dp(58)));
+        cell.addView(cellLabel(e.label), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        cell.setOnClickListener(v -> launch(e, iv, null));
+        cell.setOnClickListener(v -> {
+            if (editing) moveDialog(e);
+            else launch(e, iv, null);
+        });
         cell.setOnLongClickListener(v -> {
             showAppMenu(iv, e);
             return true;
         });
+        if (editing) {
+            ObjectAnimator a = ObjectAnimator.ofFloat(iv, "rotation", -2f, 2f);
+            a.setDuration(140);
+            a.setRepeatCount(ValueAnimator.INFINITE);
+            a.setRepeatMode(ValueAnimator.REVERSE);
+            a.start();
+        }
+        return cell;
+    }
+
+    private View addCell(final Category cat) {
+        LinearLayout cell = new LinearLayout(getContext());
+        cell.setOrientation(LinearLayout.VERTICAL);
+        cell.setGravity(Gravity.CENTER_HORIZONTAL);
+        View plus = new View(getContext()) {
+            final Glass.Panel panel = new Glass.Panel(dark, density);
+            final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            final RectF r = new RectF();
+            @Override protected void onDraw(Canvas c) {
+                r.set(0, 0, getWidth(), getHeight());
+                panel.draw(c, r, getWidth() * 0.24f);
+                p.setColor(0xE6FFFFFF);
+                p.setStrokeWidth(3f * density);
+                p.setStrokeCap(Paint.Cap.ROUND);
+                float cx = getWidth() / 2f, cy = getHeight() / 2f, s = getWidth() * 0.2f;
+                c.drawLine(cx - s, cy, cx + s, cy, p);
+                c.drawLine(cx, cy - s, cx, cy + s, p);
+            }
+        };
+        cell.addView(plus, new LinearLayout.LayoutParams(dp(58), dp(58)));
+        cell.addView(cellLabel("Add Apps"), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        cell.setOnClickListener(v -> addAppsDialog(cat));
         return cell;
     }
 
     private void closeOverlay() {
         if (!overlayOpen) return;
         overlayOpen = false;
+        overlayName = null;
         content.setRenderEffect(null);
         overlay.animate().alpha(0f).setDuration(150).setListener(new AnimatorListenerAdapter() {
             @Override public void onAnimationEnd(Animator animation) {
@@ -797,13 +1184,16 @@ public final class AppLibraryView extends FrameLayout {
                 }
             }
         }).start();
+        requestFocus();
     }
 
-    // ---------------------------------------------------------------- search
+    // ================================================================= search
 
     private void enterSearch() {
         if (searching) return;
+        if (editing) setEditing(false);
         searching = true;
+        editButton.setVisibility(GONE);
         cancel.setVisibility(VISIBLE);
         gridScroll.setVisibility(GONE);
         listScroll.setVisibility(VISIBLE);
@@ -817,6 +1207,7 @@ public final class AppLibraryView extends FrameLayout {
         InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(search.getWindowToken(), 0);
         cancel.setVisibility(GONE);
+        editButton.setVisibility(VISIBLE);
         listScroll.setVisibility(GONE);
         gridScroll.setVisibility(VISIBLE);
         list.removeAllViews();
@@ -881,11 +1272,10 @@ public final class AppLibraryView extends FrameLayout {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(8), dp(7), dp(8), dp(7));
-        ImageView iv = new ImageView(ctx);
-        iv.setImageBitmap(e.icon());
+        final ImageView iv = iconView(e.icon());
         row.addView(iv, new LinearLayout.LayoutParams(dp(40), dp(40)));
         TextView tv = new TextView(ctx);
-        tv.setText(e.app.h ? e.label + "  ·  Work" : e.label);
+        tv.setText(e.title());
         tv.setTextColor(0xFFFFFFFF);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         tv.setSingleLine(true);
@@ -906,7 +1296,7 @@ public final class AppLibraryView extends FrameLayout {
         return (c >= 'A' && c <= 'Z') ? String.valueOf(c) : "#";
     }
 
-    // ---------------------------------------------------------------- actions
+    // ================================================================= actions
 
     private void launch(Entry e, View from, RectF local) {
         Rect bounds = new Rect();
@@ -944,26 +1334,25 @@ public final class AppLibraryView extends FrameLayout {
             }
         }
         prefs.edit().putString(key, (count + 1) + "," + System.currentTimeMillis()).apply();
-        // Refresh Suggestions next time the list is rebuilt.
-        final List<?> apps = sourceApps;
         main.postDelayed(() -> {
-            if (apps == sourceApps && apps != null) {
-                sourceApps = null;
-                setApps(apps);
-            }
-        }, 1200);
+            if (!overlayOpen && !editing) recompute(null);
+        }, 1500);
     }
 
-    private void showAppMenu(View anchor, final Entry e) {
+    private void showAppMenu(final View anchor, final Entry e) {
         PopupMenu menu = new PopupMenu(getContext(), anchor);
         menu.getMenu().add(0, 1, 0, "Open");
-        menu.getMenu().add(0, 2, 1, "App info");
-        long[] info = installInfo(getContext().getPackageManager(), e.pkg);
-        if (info[1] == 0) menu.getMenu().add(0, 3, 2, "Uninstall");
+        menu.getMenu().add(0, 4, 1, "Move to Folder…");
+        menu.getMenu().add(0, 2, 2, "App info");
+        long[] info = Categories.installInfo(getContext().getPackageManager(), e.pkg);
+        if (info[1] == 0) menu.getMenu().add(0, 3, 3, "Uninstall");
         menu.setOnMenuItemClickListener(item -> {
             switch (item.getItemId()) {
                 case 1:
                     launch(e, anchor, null);
+                    return true;
+                case 4:
+                    moveDialog(e);
                     return true;
                 case 2:
                     try {
@@ -977,7 +1366,8 @@ public final class AppLibraryView extends FrameLayout {
                         Intent i = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + e.pkg));
                         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         getContext().startActivity(i);
-                    } catch (Exception ignored) {
+                    } catch (Exception ex) {
+                        Toast.makeText(getContext(), "Can't uninstall this app.", Toast.LENGTH_SHORT).show();
                     }
                     return true;
                 default:
@@ -998,15 +1388,18 @@ public final class AppLibraryView extends FrameLayout {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
-        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && (overlayOpen || searching)) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && (overlayOpen || searching || editing)) {
             if (event.getAction() == KeyEvent.ACTION_UP) {
                 if (overlayOpen) closeOverlay();
-                else exitSearch();
+                else if (searching) exitSearch();
+                else setEditing(false);
             }
             return true;
         }
         return super.dispatchKeyEvent(event);
     }
+
+    // ================================================================= frosted backdrop
 
     @Override
     protected void onAttachedToWindow() {
@@ -1035,6 +1428,12 @@ public final class AppLibraryView extends FrameLayout {
     }
 
     @Override
+    public void onWindowFocusChanged(boolean hasWindowFocus) {
+        super.onWindowFocusChanged(hasWindowFocus);
+        if (hasWindowFocus) refreshBackdrop();
+    }
+
+    @Override
     protected void onDraw(Canvas canvas) {
         getLocationInWindow(windowPos);
         drawnX = windowPos[0];
@@ -1057,25 +1456,61 @@ public final class AppLibraryView extends FrameLayout {
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         getViewTreeObserver().removeOnPreDrawListener(tracker);
+        stopJiggle();
         if (overlayOpen) {
             overlayOpen = false;
+            overlayName = null;
             content.setRenderEffect(null);
             overlay.setVisibility(GONE);
             overlay.removeAllViews();
         }
     }
 
-    // ---------------------------------------------------------------- helpers
+    // ================================================================= helpers
 
     private int dp(float v) {
         return Math.round(v * density);
     }
 
-    private static GradientDrawable roundRect(int color, float radius) {
-        GradientDrawable d = new GradientDrawable();
-        d.setColor(color);
-        d.setCornerRadius(radius);
-        return d;
+    private LinearLayout.LayoutParams wrap() {
+        return new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    }
+
+    private LinearLayout.LayoutParams pillParams() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(38));
+        lp.rightMargin = dp(8);
+        return lp;
+    }
+
+    private TextView textButton(String text) {
+        TextView b = new TextView(getContext());
+        b.setText(text);
+        b.setTextColor(0xFFFFFFFF);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        b.setPadding(dp(14), dp(8), dp(4), dp(8));
+        b.setShadowLayer(4 * density, 0, density, 0x66000000);
+        return b;
+    }
+
+    private TextView pill(String text, boolean primary) {
+        TextView b = new TextView(getContext());
+        b.setText(text);
+        b.setTextColor(primary ? 0xFF000000 : 0xFFFFFFFF);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f);
+        b.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(14), 0, dp(14), 0);
+        if (primary) {
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(0xF2FFFFFF);
+            bg.setCornerRadius(dp(19));
+            b.setBackground(bg);
+        } else {
+            b.setBackground(new Glass.PanelDrawable(dark, density, dp(19)));
+        }
+        return b;
     }
 
     /** Small magnifying-glass glyph for the search field. */

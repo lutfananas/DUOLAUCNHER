@@ -1,1 +1,1 @@
-package com.jake.duolauncher; public class MainActivity extends android.app.Activity { public final void o(G1.a app, android.graphics.Rect r) {} }
+package com.jake.duolauncher; public class MainActivity extends android.app.Activity { public final void o(G1.a app, android.graphics.Rect r) {} public final G1.Y2 l() { return null; } }
