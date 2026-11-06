@@ -7,7 +7,11 @@ dec = pathlib.Path(sys.argv[1])
 s5 = dec / "smali/G1/s5.smali"
 old = ("invoke-static/range {v3 .. v18}, LI1/y;->b(LG1/L5;Ljava/lang/String;LU1/c;LU1/c;LU1/e;"
        "LU1/c;La0/r;ZLG1/B2;Ljava/lang/Integer;LU1/e;LU1/c;LO/o;III)V")
-new = "invoke-static {v3, v9, v15}, Lcom/jake/duolauncher/applib/AppLibrary;->content(LG1/L5;La0/r;LO/o;)V"
+# v0 = this (G1/s5), field k = bottom padding (dock height, dp). v10 is restored after.
+new = ("iget v10, v0, LG1/s5;->k:F\n\n"
+       "    invoke-static {v3, v9, v15, v10}, Lcom/jake/duolauncher/applib/AppLibrary;->"
+       "content(LG1/L5;La0/r;LO/o;F)V\n\n"
+       "    const/4 v10, 0x0")
 text = s5.read_text()
 if text.count(old) != 1:
     sys.exit("hook site not found in G1/s5.smali (unexpected APK version?)")

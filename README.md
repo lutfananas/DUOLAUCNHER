@@ -22,9 +22,16 @@ Mod dari `DuoLauncher-0.15.0-beta01-release.apk`. Halaman Library di home screen
   Utilities, Games, Travel, Shopping & Food, Health & Fitness,
   Information & Reading, Other — dari kategori Android + kata kunci nama paket.
 - Tekan lama ikon → menu **Open / App info / Uninstall**.
+- **Frosted glass**: halaman App Library menampilkan foto latar launcher yang diburamkan
+  (sedikit lebih jenuh warnanya, seperti iOS). Latar buram ini ikut bergeser masuk saat
+  halaman digeser. Folder, kolom pencarian, dan daftar hasil pencarian memakai panel kaca
+  (isi transparan, kilau di bagian atas, garis tepi tipis). Kalau latar launcher bukan foto
+  (latar bawaan), yang muncul hanya panel kaca dengan sedikit gelap, tanpa blur.
 
 ## Cara kerja
 - `mod/src/.../AppLibraryView.java` — tampilan App Library (View Android biasa).
+- `mod/src/.../Glass.java` — blur latar (box blur pada salinan kecil
+  `files/launcher-background.jpg`) dan panel kaca.
 - `mod/src/.../AppLibrary.java` — jembatan ke Compose (`AndroidView`), menerima daftar
   aplikasi dari state launcher.
 - `mod/patch.py` — mengganti satu pemanggilan di `smali/G1/s5.smali` (halaman

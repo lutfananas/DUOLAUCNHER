@@ -96,6 +96,19 @@ public final class AppLibraryView extends FrameLayout {
     private boolean searching;
     private boolean overlayOpen;
 
+    // Frosted backdrop: the launcher's background photo, blurred, pinned to the window.
+    private Bitmap backdrop;
+    private final Paint backdropPaint = Glass.backdropPaint();
+    private final Paint tintPaint = new Paint();
+    private final android.graphics.Matrix backdropMatrix = new android.graphics.Matrix();
+    private final int[] windowPos = new int[2];
+    private int drawnX = Integer.MIN_VALUE, drawnY = Integer.MIN_VALUE;
+    private final android.view.ViewTreeObserver.OnPreDrawListener tracker = () -> {
+        getLocationInWindow(windowPos);
+        if (windowPos[0] != drawnX || windowPos[1] != drawnY) invalidate();
+        return true;
+    };
+
     static final class Entry {
         final G1.a app;
         final String label;
@@ -136,6 +149,8 @@ public final class AppLibraryView extends FrameLayout {
                 == Configuration.UI_MODE_NIGHT_YES;
         prefs = context.getSharedPreferences("duo_app_library", Context.MODE_PRIVATE);
         setClipChildren(false);
+        setWillNotDraw(false);
+        tintPaint.setColor(dark ? 0x40000000 : 0x14000000);
         setFocusable(true);
         setFocusableInTouchMode(true);
 
@@ -163,7 +178,7 @@ public final class AppLibraryView extends FrameLayout {
         MagnifierDrawable glass = new MagnifierDrawable(0xCCFFFFFF, density);
         glass.setBounds(0, 0, dp(18), dp(18));
         search.setCompoundDrawablesRelative(glass, null, null, null);
-        search.setBackground(roundRect(tileColor(), dp(12)));
+        search.setBackground(new Glass.PanelDrawable(dark, density, dp(12)));
         search.setShadowLayer(0, 0, 0, 0);
         searchRow.addView(search, new LinearLayout.LayoutParams(0, dp(42), 1f));
 
@@ -235,6 +250,17 @@ public final class AppLibraryView extends FrameLayout {
             }
             return false;
         });
+    }
+
+    private float bottomInsetDp = -1;
+
+    /** Page insets: the backdrop fills the whole page, content stays clear of the dock. */
+    void setBottomInset(float dockDp) {
+        if (dockDp == bottomInsetDp) return;
+        bottomInsetDp = dockDp;
+        int bottom = dp(Math.max(0f, dockDp));
+        content.setPadding(dp(12), dp(16), dp(12), bottom);
+        overlay.setPadding(dp(4), dp(16), dp(4), bottom);
     }
 
     // ---------------------------------------------------------------- data
@@ -526,14 +552,11 @@ public final class AppLibraryView extends FrameLayout {
         return box;
     }
 
-    private int tileColor() {
-        return dark ? 0x59303034 : 0x47FFFFFF;
-    }
-
     /** A category folder: 3 large icons + a 2x2 cluster of small icons. */
     final class TileView extends View {
         private final Category cat;
-        private final Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Glass.Panel glass = new Glass.Panel(dark, density);
+        private final RectF bounds = new RectF();
         private final Paint icon = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         private final RectF tmp = new RectF();
         private final GestureDetector gestures;
@@ -542,7 +565,6 @@ public final class AppLibraryView extends FrameLayout {
         TileView(Context ctx, Category cat) {
             super(ctx);
             this.cat = cat;
-            bg.setColor(tileColor());
             setContentDescription(cat.name);
             gestures = new GestureDetector(ctx, new GestureDetector.SimpleOnGestureListener() {
                 @Override public boolean onDown(MotionEvent e) {
@@ -634,7 +656,8 @@ public final class AppLibraryView extends FrameLayout {
         protected void onDraw(Canvas c) {
             float w = getWidth();
             float radius = w * 0.2f;
-            c.drawRoundRect(0, 0, w, getHeight(), radius, radius, bg);
+            bounds.set(0, 0, w, getHeight());
+            glass.draw(c, bounds, radius);
             int n = cat.apps.size();
             for (int q = 0; q < 4; q++) {
                 RectF r = cell(q);
@@ -657,7 +680,6 @@ public final class AppLibraryView extends FrameLayout {
         private void drawIcon(Canvas c, Entry e, RectF r) {
             Bitmap b = e.icon();
             if (b == null || b.isRecycled()) return;
-            icon.setAlpha(e.available() ? 255 : 110);
             c.drawBitmap(b, null, r, icon);
         }
     }
@@ -742,7 +764,6 @@ public final class AppLibraryView extends FrameLayout {
         cell.setGravity(Gravity.CENTER_HORIZONTAL);
         ImageView iv = new ImageView(ctx);
         iv.setImageBitmap(e.icon());
-        iv.setAlpha(e.available() ? 1f : 0.45f);
         iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
         cell.addView(iv, new LinearLayout.LayoutParams(dp(58), dp(58)));
         TextView tv = new TextView(ctx);
@@ -836,7 +857,7 @@ public final class AppLibraryView extends FrameLayout {
                 }
                 section = new LinearLayout(ctx);
                 section.setOrientation(LinearLayout.VERTICAL);
-                section.setBackground(roundRect(tileColor(), dp(14)));
+                section.setBackground(new Glass.PanelDrawable(dark, density, dp(14)));
                 section.setPadding(dp(4), dp(2), dp(4), dp(2));
                 list.addView(section, new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -862,7 +883,6 @@ public final class AppLibraryView extends FrameLayout {
         row.setPadding(dp(8), dp(7), dp(8), dp(7));
         ImageView iv = new ImageView(ctx);
         iv.setImageBitmap(e.icon());
-        iv.setAlpha(e.available() ? 1f : 0.45f);
         row.addView(iv, new LinearLayout.LayoutParams(dp(40), dp(40)));
         TextView tv = new TextView(ctx);
         tv.setText(e.app.h ? e.label + "  ·  Work" : e.label);
@@ -989,8 +1009,54 @@ public final class AppLibraryView extends FrameLayout {
     }
 
     @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        getViewTreeObserver().addOnPreDrawListener(tracker);
+        refreshBackdrop();
+    }
+
+    private void refreshBackdrop() {
+        final Context ctx = getContext();
+        WORKER.execute(() -> {
+            final Bitmap b = Glass.blurredBackground(ctx);
+            main.post(() -> {
+                if (b != backdrop) {
+                    backdrop = b;
+                    invalidate();
+                }
+            });
+        });
+    }
+
+    @Override
+    protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        if (visibility == VISIBLE) refreshBackdrop();
+    }
+
+    @Override
+    protected void onDraw(Canvas canvas) {
+        getLocationInWindow(windowPos);
+        drawnX = windowPos[0];
+        drawnY = windowPos[1];
+        Bitmap b = backdrop;
+        View root = getRootView();
+        if (b != null && !b.isRecycled() && root != null && root.getWidth() > 0) {
+            // Draw the blurred background as if it covered the whole window, so it
+            // lines up with the real background while the page slides in.
+            canvas.save();
+            canvas.translate(-drawnX, -drawnY);
+            Glass.centerCrop(b, root.getWidth(), root.getHeight(), backdropMatrix);
+            canvas.drawBitmap(b, backdropMatrix, backdropPaint);
+            canvas.restore();
+        }
+        canvas.drawRect(0, 0, getWidth(), getHeight(), tintPaint);
+    }
+
+    @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
+        getViewTreeObserver().removeOnPreDrawListener(tracker);
         if (overlayOpen) {
             overlayOpen = false;
             content.setRenderEffect(null);

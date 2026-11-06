@@ -15,19 +15,31 @@ public final class AppLibrary implements U1.c {
 
     private static final AppLibrary FACTORY = new AppLibrary();
     private static volatile List<?> latestApps;
+    private static volatile float latestBottomDp;
     private static WeakReference<AppLibraryView> current = new WeakReference<>(null);
 
     private AppLibrary() {
     }
 
-    /** Called from smali: replaces I1.y.b(...) for the library page. */
-    public static void content(G1.L5 state, a0.r modifier, O.o composer) {
+    /**
+     * Called from smali: replaces I1.y.b(...) for the library page.
+     *
+     * @param modifier    the page modifier from the launcher (has padding; unused so the
+     *                    frosted backdrop can fill the whole page)
+     * @param bottomDp    bottom padding the launcher reserves for the dock, in dp
+     */
+    public static void content(G1.L5 state, a0.r modifier, O.o composer, float bottomDp) {
         final List<?> apps = state != null ? state.a : null;
         latestApps = apps;
-        androidx.compose.ui.viewinterop.a.b(FACTORY, modifier, null, composer, 48);
+        latestBottomDp = bottomDp;
+        a0.r fill = androidx.compose.foundation.layout.d.c;
+        androidx.compose.ui.viewinterop.a.b(FACTORY, fill != null ? fill : modifier, null, composer, 48);
         final AppLibraryView view = current.get();
-        if (view != null && apps != null) {
-            view.post(() -> view.setApps(apps));
+        if (view != null) {
+            view.post(() -> {
+                view.setBottomInset(bottomDp);
+                if (apps != null) view.setApps(apps);
+            });
         }
     }
 
@@ -36,6 +48,7 @@ public final class AppLibrary implements U1.c {
     public Object h(Object context) {
         AppLibraryView view = new AppLibraryView((Context) context);
         current = new WeakReference<>(view);
+        view.setBottomInset(latestBottomDp);
         List<?> apps = latestApps;
         if (apps != null) {
             view.setApps(apps);
