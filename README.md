@@ -29,6 +29,12 @@ Mod dari `DuoLauncher-0.15.0-beta01-release.apk`. Halaman Library di home screen
   - **Wallpaper**: pilih foto dari galeri sebagai latar launcher, atau kembali ke
     "Duo dunes". Latar langsung berganti, blur kaca ikut diperbarui.
 - Tekan lama aplikasi di mana saja → **Move to Folder…** juga tersedia.
+- **Icon pack** (tombol *Icons* di mode Edit, atau tekan lama area kosong → *Icon Pack*):
+  pilih icon pack yang terpasang (format Nova / ADW / Apex). Ikon berganti di **seluruh
+  launcher**: home, dock, folder, dan App Library. Tombol *Unsupported icons* mengatur apakah
+  ikon yang tidak ada di pack dibuat senada (latar/masker dari pack) atau tetap asli.
+- **Ganti ikon satu aplikasi**: tekan lama aplikasi di App Library → *Change Icon…* → pilih
+  ikon dari icon pack mana pun (ada pencarian), pakai ikon asli, atau reset.
 - Kategori otomatis: Social, Entertainment, Creativity, Productivity & Finance,
   Utilities, Games, Travel, Shopping & Food, Health & Fitness,
   Information & Reading, Other — dari kategori Android + kata kunci nama paket.
@@ -45,6 +51,9 @@ Mod dari `DuoLauncher-0.15.0-beta01-release.apk`. Halaman Library di home screen
 - `mod/src/.../Categories.java` — kategori otomatis.
 - `mod/src/.../WallpaperActivity.java` — pemilih foto; menyimpan ke file & preferensi yang
   sama dengan menu "Wallpaper & appearance" bawaan dan memperbarui latar secara langsung.
+- `mod/src/.../AppIcons.java`, `IconPack.java`, `IconPicker.java` — dukungan icon pack.
+  `patch.py` menyisipkan `AppIcons.themed(...)` ke constructor entri aplikasi (`G1/a`) dan
+  `AppIcons.init(...)` ke `DuoApplication.onCreate`, plus `<queries>` agar icon pack terlihat.
 - `mod/src/.../Glass.java` — blur latar (box blur pada salinan kecil
   `files/launcher-background.jpg`) dan panel kaca.
 - `mod/src/.../AppLibrary.java` — jembatan ke Compose (`AndroidView`), menerima daftar

@@ -234,16 +234,26 @@ public final class AppLibraryView extends FrameLayout {
         editBar.setGravity(Gravity.CENTER_VERTICAL);
         editBar.setPadding(dp(4), dp(6), dp(4), dp(14));
         editBar.setVisibility(GONE);
+        android.widget.HorizontalScrollView pillScroll = new android.widget.HorizontalScrollView(context);
+        pillScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout pills = new LinearLayout(context);
+        pills.setOrientation(LinearLayout.HORIZONTAL);
+        pills.setGravity(Gravity.CENTER_VERTICAL);
         View newFolder = pill("＋ Folder", false);
         newFolder.setOnClickListener(v -> newFolderDialog(null));
-        editBar.addView(newFolder, pillParams());
+        pills.addView(newFolder, pillParams());
         View wallpaper = pill("Wallpaper", false);
         wallpaper.setOnClickListener(v -> wallpaperDialog());
-        editBar.addView(wallpaper, pillParams());
+        pills.addView(wallpaper, pillParams());
+        View icons = pill("Icons", false);
+        icons.setOnClickListener(v -> iconPackDialog());
+        pills.addView(icons, pillParams());
         View reset = pill("Reset", false);
         reset.setOnClickListener(v -> resetDialog());
-        editBar.addView(reset, pillParams());
-        editBar.addView(new View(context), new LinearLayout.LayoutParams(0, 1, 1f));
+        pills.addView(reset, pillParams());
+        pillScroll.addView(pills, new android.widget.HorizontalScrollView.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        editBar.addView(pillScroll, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         View done = pill("Done", true);
         done.setOnClickListener(v -> setEditing(false));
         editBar.addView(done, new LinearLayout.LayoutParams(
@@ -763,11 +773,13 @@ public final class AppLibraryView extends FrameLayout {
         menu.getMenu().add(0, 1, 0, editing ? "Done" : "Edit App Library");
         menu.getMenu().add(0, 2, 1, "New Folder");
         menu.getMenu().add(0, 3, 2, "Change Wallpaper");
+        menu.getMenu().add(0, 5, 3, "Icon Pack");
         menu.setOnMenuItemClickListener(item -> {
             switch (item.getItemId()) {
                 case 1: setEditing(!editing); return true;
                 case 2: newFolderDialog(null); return true;
                 case 3: wallpaperDialog(); return true;
+                case 5: iconPackDialog(); return true;
                 default: return false;
             }
         });
@@ -990,6 +1002,18 @@ public final class AppLibraryView extends FrameLayout {
                     recompute(null);
                 })
                 .show();
+    }
+
+    private void iconPackDialog() {
+        IconPicker.choosePack(getContext(), dark, this::iconsChanged);
+    }
+
+    /** Asks the launcher to rebuild app entries so the new icons show everywhere. */
+    private void iconsChanged(String pkg) {
+        Activity act = activity();
+        if (act instanceof com.jake.duolauncher.MainActivity) {
+            AppIcons.reload((com.jake.duolauncher.MainActivity) act, sourceApps, pkg);
+        }
     }
 
     private void wallpaperDialog() {
@@ -1343,7 +1367,8 @@ public final class AppLibraryView extends FrameLayout {
         PopupMenu menu = new PopupMenu(getContext(), anchor);
         menu.getMenu().add(0, 1, 0, "Open");
         menu.getMenu().add(0, 4, 1, "Move to Folder…");
-        menu.getMenu().add(0, 2, 2, "App info");
+        menu.getMenu().add(0, 5, 2, "Change Icon…");
+        menu.getMenu().add(0, 2, 3, "App info");
         long[] info = Categories.installInfo(getContext().getPackageManager(), e.pkg);
         if (info[1] == 0) menu.getMenu().add(0, 3, 3, "Uninstall");
         menu.setOnMenuItemClickListener(item -> {
@@ -1353,6 +1378,11 @@ public final class AppLibraryView extends FrameLayout {
                     return true;
                 case 4:
                     moveDialog(e);
+                    return true;
+                case 5:
+                    if (e.app.d != null) {
+                        IconPicker.changeAppIcon(getContext(), dark, e.app.d, e.label, this::iconsChanged);
+                    }
                     return true;
                 case 2:
                     try {

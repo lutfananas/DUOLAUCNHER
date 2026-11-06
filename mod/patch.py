@@ -38,7 +38,43 @@ if "applib.WallpaperActivity" not in m:
         sys.exit("could not register WallpaperActivity")
     manifest.write_text(m)
 
-# 4. Mark the build.
+# 4. Icon packs: theme every app icon as the launcher creates its app entries.
+entry = dec / "smali/G1/a.smali"
+t = entry.read_text()
+ctor = (".method public constructor <init>(Ljava/lang/String;Ljava/lang/String;Landroid/graphics/Bitmap;"
+        "Landroid/content/ComponentName;Landroid/os/UserHandle;JLjava/lang/String;ZZ)V")
+anchor = "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n"
+i = t.find(ctor)
+j = t.find(anchor, i)
+if i < 0 or j < 0:
+    sys.exit("app entry constructor not found in G1/a.smali")
+hook = (anchor + "\n    invoke-static {p3, p4, p5}, Lcom/jake/duolauncher/applib/AppIcons;->"
+        "themed(Landroid/graphics/Bitmap;Landroid/content/ComponentName;Landroid/os/UserHandle;)"
+        "Landroid/graphics/Bitmap;\n\n    move-result-object p3\n")
+t = t[:j] + hook + t[j + len(anchor):]
+entry.write_text(t)
+
+appf = dec / "smali/com/jake/duolauncher/DuoApplication.smali"
+a = appf.read_text()
+sup = "    invoke-super {p0}, Landroid/app/Application;->onCreate()V\n"
+if a.count(sup) != 1:
+    sys.exit("DuoApplication.onCreate not found")
+a = a.replace(sup, sup + "\n    invoke-static {p0}, Lcom/jake/duolauncher/applib/AppIcons;->init(Landroid/content/Context;)V\n")
+appf.write_text(a)
+
+# Package visibility: let the launcher see installed icon packs.
+m = manifest.read_text()
+actions = ["org.adw.launcher.THEMES", "org.adw.launcher.icons.ACTION_PICK_ICON",
+           "com.novalauncher.THEME", "com.teslacoilsw.launcher.THEME", "com.anddoes.launcher.THEME",
+           "com.gau.go.launcherex.theme", "com.fede.launcher.THEME_ICONPACK",
+           "com.dlto.atom.launcher.THEME", "ch.deletescape.lawnchair.ICONPACK",
+           "app.lawnchair.icons.THEMED_ICON"]
+q = "".join('\n        <intent>\n            <action android:name="%s"/>\n        </intent>' % x for x in actions)
+if "org.adw.launcher.THEMES" not in m:
+    m = m.replace("</queries>", q + "\n    </queries>", 1)
+    manifest.write_text(m)
+
+# 5. Mark the build.
 yml = dec / "apktool.yml"
 y = yml.read_text()
 yml.write_text(y.replace("versionName: 0.15.0-beta01", "versionName: 0.15.0-beta01-applibrary"))
